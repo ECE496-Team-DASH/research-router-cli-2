@@ -44,6 +44,7 @@ class Elia(App[None]):
         self._runtime_config = RuntimeConfig(
             selected_model=config.default_model_object,
             system_prompt=config.system_prompt,
+            graphrag_config=config.graphrag,
         )
         self.runtime_config_signal = Signal[RuntimeConfig](
             self, "runtime-config-updated"
@@ -59,8 +60,11 @@ class Elia(App[None]):
         """
 
         super().__init__()
+        
+        # Set theme after calling super().__init__ to avoid reactive error
+        self.theme = config.theme
 
-    theme: Reactive[str | None] = reactive(None, init=False)
+    theme: Reactive[str | None] = reactive(None)
 
     @property
     def runtime_config(self) -> RuntimeConfig:
@@ -73,7 +77,7 @@ class Elia(App[None]):
 
     async def on_mount(self) -> None:
         await self.push_screen(HomeScreen(self.runtime_config_signal))
-        self.theme = self.launch_config.theme
+        # Theme is already set in __init__, no need to set it again here
         if self.startup_prompt:
             await self.launch_chat(
                 prompt=self.startup_prompt,

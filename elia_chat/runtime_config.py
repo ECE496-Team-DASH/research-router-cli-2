@@ -1,6 +1,6 @@
 from pydantic import BaseModel, ConfigDict
 
-from elia_chat.config import EliaChatModel
+from elia_chat.config import EliaChatModel, GraphRAGConfig
 
 
 class RuntimeConfig(BaseModel):
@@ -8,3 +8,4 @@ class RuntimeConfig(BaseModel):
 
     selected_model: EliaChatModel
     system_prompt: str
+    graphrag_config: GraphRAGConfig

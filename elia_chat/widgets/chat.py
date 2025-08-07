@@ -23,6 +23,7 @@ from elia_chat.widgets.agent_is_typing import ResponseStatus
 from elia_chat.widgets.chat_header import ChatHeader, TitleStatic
 from elia_chat.widgets.prompt_input import PromptInput
 from elia_chat.widgets.chatbox import Chatbox
+from elia_chat.graphrag_chat_manager import GraphRAGChatManager
 
 
 if TYPE_CHECKING:
@@ -66,6 +67,11 @@ class Chat(Widget):
         self.chat_data = chat_data
         self.elia = cast("Elia", self.app)
         self.model = chat_data.model
+        
+        # Initialize GraphRAG chat manager
+        self.graphrag_manager = GraphRAGChatManager(
+            self.elia.runtime_config.graphrag_config
+        )
 
     @dataclass
     class AgentResponseStarted(Message):
@@ -158,36 +164,14 @@ class Chat(Widget):
         model = self.chat_data.model
         log.debug(f"Creating streaming response with model {model.name!r}")
 
-        import litellm
-        from litellm import ModelResponse, acompletion
-        from litellm.utils import trim_messages
-
-        raw_messages = [message.message for message in self.chat_data.messages]
-
-        messages: list[ChatCompletionUserMessageParam] = trim_messages(
-            raw_messages, model.name
-        )  # type: ignore
-
-        litellm.organization = model.organization
-        try:
-            response = await acompletion(
-                messages=messages,
-                stream=True,
-                model=model.name,
-                temperature=model.temperature,
-                max_retries=model.max_retries,
-                api_key=model.api_key.get_secret_value() if model.api_key else None,
-                api_base=model.api_base.unicode_string() if model.api_base else None,
-            )
-        except Exception as exception:
-            self.app.notify(
-                f"{exception}",
-                title="Error",
-                severity="error",
-                timeout=constants.ERROR_NOTIFY_TIMEOUT_SECS,
-            )
-            self.post_message(self.AgentResponseFailed(self.chat_data.messages[-1]))
-            return
+        # Get the last user message for GraphRAG context
+        last_user_message = ""
+        for msg in reversed(self.chat_data.messages):
+            if msg.message.get("role") == "user":
+                content = msg.message.get("content", "")
+                if isinstance(content, str):
+                    last_user_message = content
+                break
 
         ai_message: ChatCompletionAssistantMessageParam = {
             "content": "",
@@ -209,31 +193,45 @@ class Chat(Widget):
         ), "Textual has mounted container at this point in the lifecycle."
 
         try:
-            chunk_count = 0
-            async for chunk in response:
-                chunk = cast(ModelResponse, chunk)
-                response_chatbox.border_title = "Agent is responding..."
+            # Check if we should use GraphRAG for this query
+            use_graphrag = await self.graphrag_manager.should_use_graphrag(last_user_message)
+            
+            if use_graphrag:
+                log.debug("Using GraphRAG-enhanced response")
+                response_stream = self.graphrag_manager.generate_enhanced_response(
+                    self.chat_data, last_user_message, model
+                )
+            else:
+                log.debug("Using regular LLM response")
+                response_stream = self.graphrag_manager.generate_regular_response(
+                    self.chat_data, model
+                )
 
-                chunk_content = chunk.choices[0].delta.content
+            chunk_count = 0
+            async for chunk_content in response_stream:
+                if use_graphrag:
+                    response_chatbox.border_title = "Agent is responding (with GraphRAG)..."
+                else:
+                    response_chatbox.border_title = "Agent is responding..."
+
                 if isinstance(chunk_content, str):
                     self.app.call_from_thread(
                         response_chatbox.append_chunk, chunk_content
                     )
-                else:
-                    break
 
-                scroll_y = self.chat_container.scroll_y
-                max_scroll_y = self.chat_container.max_scroll_y
-                if scroll_y in range(max_scroll_y - 3, max_scroll_y + 1):
-                    self.app.call_from_thread(
-                        self.chat_container.scroll_end, animate=False
-                    )
+                    scroll_y = self.chat_container.scroll_y
+                    max_scroll_y = self.chat_container.max_scroll_y
+                    if scroll_y in range(max_scroll_y - 3, max_scroll_y + 1):
+                        self.app.call_from_thread(
+                            self.chat_container.scroll_end, animate=False
+                        )
 
-                chunk_count += 1
-        except Exception:
-            self.notify(
-                "There was a problem using this model. "
-                "Please check your configuration file.",
+                    chunk_count += 1
+                    
+        except Exception as exception:
+            log.error(f"Error in stream_agent_response: {exception}")
+            self.app.notify(
+                f"{exception}",
                 title="Error",
                 severity="error",
                 timeout=constants.ERROR_NOTIFY_TIMEOUT_SECS,

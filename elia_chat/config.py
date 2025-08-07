@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, SecretStr
 
 
@@ -148,6 +149,28 @@ def get_builtin_models() -> list[EliaChatModel]:
     )
 
 
+class GraphRAGConfig(BaseModel):
+    """Configuration for GraphRAG functionality."""
+    
+    enabled: bool = Field(default=False)
+    """Whether GraphRAG is enabled for enhanced search and chat."""
+    
+    documents_folder: str | None = Field(default=None)
+    """Folder path containing documents to be indexed (.txt, .md, .pdf files)."""
+    
+    storage_folder: str | None = Field(default=None)
+    """Folder path for GraphRAG instance storage and persistence."""
+    
+    graphrag_model: str | None = Field(default=None)
+    """Model to use for GraphRAG operations (entity extraction, etc.)."""
+    
+    embedding_model: str | None = Field(default=None)
+    """Model to use for embeddings in GraphRAG."""
+    
+    query_mode: str = Field(default="global")
+    """Default query mode for GraphRAG: 'global', 'local', or 'naive'."""
+
+
 class LaunchConfig(BaseModel):
     """The config of the application at launch.
 
@@ -170,6 +193,7 @@ class LaunchConfig(BaseModel):
         default_factory=get_builtin_models, init=False
     )
     theme: str = Field(default="nebula")
+    graphrag: GraphRAGConfig = Field(default_factory=GraphRAGConfig)
 
     @property
     def all_models(self) -> list[EliaChatModel]:
