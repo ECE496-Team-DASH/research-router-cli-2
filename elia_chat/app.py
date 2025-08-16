@@ -122,8 +122,15 @@ class Elia(App[None]):
             await self.push_screen(HelpScreen())
 
     def get_css_variables(self) -> dict[str, str]:
-        if self.theme:
-            theme = self.themes.get(self.theme)
+        # Handle case where theme might be accessed during initialization
+        try:
+            theme_name = self.theme
+        except AttributeError:
+            # If theme reactive isn't initialized yet, use the config theme
+            theme_name = getattr(self, 'launch_config', None) and self.launch_config.theme
+        
+        if theme_name:
+            theme = self.themes.get(theme_name)
             if theme:
                 color_system = theme.to_color_system().generate()
             else:
@@ -133,9 +140,11 @@ class Elia(App[None]):
 
         return {**super().get_css_variables(), **color_system}
 
-    def watch_theme(self, theme: str | None) -> None:
-        self.refresh_css(animate=False)
-        self.screen._update_styles()
+    def watch_theme(self, theme: str) -> None:
+        """Called when the theme changes."""
+        # Only refresh CSS if we have screens on the stack
+        if self.screen_stack:
+            self.refresh_css(animate=False)
 
     @property
     def theme_object(self) -> Theme | None:
