@@ -107,6 +107,8 @@ class NanoGraphRAGModel:
                         enable_llm_cache=True,
                         enable_local=True,
                         enable_naive_rag=False,  # can toggle via config later
+                        best_model_max_async=7,
+                        cheap_model_max_async=7,
                     )
                     log.info(f"Successfully created GraphRAG session for chat {chat_id} at {session.working_dir}")
                 except Exception as e:
@@ -284,10 +286,33 @@ class NanoGraphRAGModel:
                         # Start progress monitoring
                         progress_task = asyncio.create_task(progress_monitor())
                         
-                        # Run the actual insertion
-                        with capture():
-                            await session.graphrag_instance.ainsert(text_content)
-                            await flush()
+                        # Run the actual insertion with retry logic for rate limits
+                        max_retries = 5
+                        retry_delay = 10  # Start with 10 seconds
+                        
+                        for attempt in range(max_retries):
+                            try:
+                                with capture():
+                                    await session.graphrag_instance.ainsert(text_content)
+                                    await flush()
+                                break  # Success - exit retry loop
+                                
+                            except Exception as e:
+                                error_str = str(e)
+                                if ("RateLimitError" in error_str or "rate limit" in error_str.lower() or 
+                                    "quota" in error_str.lower() or "too many requests" in error_str.lower()):
+                                    
+                                    if attempt < max_retries - 1:
+                                        emit_line(f"[RETRY] Rate limited, waiting {retry_delay}s before retry {attempt + 2}/{max_retries}...\n")
+                                        await asyncio.sleep(retry_delay)
+                                        retry_delay = min(retry_delay * 2, 300)  # Exponential backoff, max 5 minutes
+                                        continue
+                                    else:
+                                        emit_line(f"[ERROR] Rate limit exceeded after {max_retries} attempts\n")
+                                        raise Exception(f"Rate limit exceeded after {max_retries} attempts. Please try again later.")
+                                else:
+                                    # Non-rate-limit error, don't retry
+                                    raise
                         
                     finally:
                         # Stop progress monitoring
@@ -347,13 +372,33 @@ class NanoGraphRAGModel:
             if not text.strip():
                 return {"error": "Text is empty"}
             
-            # Insert into GraphRAG
-            if hasattr(session.graphrag_instance, 'ainsert'):
-                await session.graphrag_instance.ainsert(text)
-            else:
-                # Run sync insert in executor
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, session.graphrag_instance.insert, text)
+            # Insert into GraphRAG with retry logic
+            max_retries = 5
+            retry_delay = 10
+            
+            for attempt in range(max_retries):
+                try:
+                    if hasattr(session.graphrag_instance, 'ainsert'):
+                        await session.graphrag_instance.ainsert(text)
+                    else:
+                        # Run sync insert in executor
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, session.graphrag_instance.insert, text)
+                    break  # Success
+                    
+                except Exception as e:
+                    error_str = str(e)
+                    if ("RateLimitError" in error_str or "rate limit" in error_str.lower() or 
+                        "quota" in error_str.lower() or "too many requests" in error_str.lower()):
+                        
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay)
+                            retry_delay = min(retry_delay * 2, 300)
+                            continue
+                        else:
+                            raise Exception(f"Rate limit exceeded after {max_retries} attempts. Please try again later.")
+                    else:
+                        raise
             
             return {
                 "message": "Successfully indexed text",
@@ -650,6 +695,321 @@ Example: `/insert-text This is important information about the project.`
                 yield response
                 return
             
+            elif user_message.lower().startswith("/insert-folder "):
+                # Handle folder insertion
+                folder_path = user_message[15:].strip()
+                
+                yield "# Folder Insertion Starting\n\n[INIT] **Preparing to insert documents from folder...**\n\n"
+                yield f"**Folder:** `{folder_path}`\n\n"
+                yield "**[PROGRESS] Scanning for documents:**\n\n```\n"
+                
+                try:
+                    from pathlib import Path
+                    import os
+                    folder = Path(folder_path.strip().strip('"').strip("'")).expanduser()
+                    if not folder.is_absolute():
+                        folder = Path(os.getcwd()) / folder
+                    
+                    if not folder.exists() or not folder.is_dir():
+                        yield "```\n\n❌ **Error:** Folder not found or invalid path\n"
+                        return
+                    
+                    # Find supported files
+                    supported_extensions = {'.txt', '.md', '.pdf', '.docx'}
+                    files_found = []
+                    for ext in supported_extensions:
+                        files_found.extend(folder.rglob(f"*{ext}"))
+                    
+                    yield f"Found {len(files_found)} supported documents\n"
+                    
+                    if not files_found:
+                        yield "```\n\n⚠️ **No supported documents found in folder**\n"
+                        return
+                    
+                    yield "```\n\n**[PROGRESS] Processing documents:**\n\n"
+                    
+                    successful = 0
+                    skipped = 0
+                    failed = 0
+                    
+                    for i, file_path in enumerate(files_found, 1):
+                        yield f"📄 [{i}/{len(files_found)}] {file_path.name}\n"
+                        
+                        try:
+                            result = await self.insert_document(chat_id, str(file_path))
+                            
+                            if "error" in result:
+                                yield f"   ❌ Error: {result['error']}\n"
+                                failed += 1
+                            elif result.get("status") == "skipped":
+                                yield f"   ⏭️ Skipped (already indexed)\n"
+                                skipped += 1
+                            else:
+                                yield f"   ✅ Success\n"
+                                successful += 1
+                        except Exception as e:
+                            yield f"   ❌ Exception: {str(e)}\n"
+                            failed += 1
+                        
+                        await asyncio.sleep(0.05)  # Brief pause for responsiveness
+                    
+                    yield f"\n---\n\n"
+                    yield f"# Folder Insertion Complete\n\n"
+                    yield f"**Summary:**\n"
+                    yield f"- ✅ Successfully indexed: {successful}\n"
+                    yield f"- ⏭️ Skipped (duplicates): {skipped}\n"
+                    yield f"- ❌ Failed: {failed}\n"
+                    yield f"- 📁 Total processed: {len(files_found)}\n\n"
+                    
+                    if successful > 0:
+                        session_info = self.get_session_info(chat_id)
+                        yield f"📚 Total documents in session: {session_info.get('indexed_documents', 0)}\n\n"
+                        yield "🎉 Folder insertion completed! You can now ask questions about the content.\n"
+                    
+                except Exception as e:
+                    yield f"```\n\n❌ **Error during folder insertion:** {str(e)}\n"
+                
+                return
+            
+            elif user_message.lower().startswith("/insert-arxiv "):
+                # Handle arXiv search and insertion with paper selection
+                search_query = user_message[14:].strip()
+                
+                yield "# arXiv Paper Search & Selection\n\n[INIT] **Searching arXiv database...**\n\n"
+                yield f"**Query:** `{search_query}`\n\n"
+                
+                try:
+                    # Check if feedparser is available
+                    try:
+                        import feedparser
+                        import aiohttp
+                        import tempfile
+                        from pathlib import Path
+                    except ImportError as e:
+                        yield f"[ERROR] **Error:** Missing required package: {str(e)}\n"
+                        yield "Install with: `pip install feedparser aiohttp`\n"
+                        return
+                    
+                    yield "**[PROGRESS] Searching papers:**\n\n```\n"
+                    
+                    # Search arXiv
+                    base_url = "http://export.arxiv.org/api/query"
+                    params = {
+                        "search_query": search_query,
+                        "start": 0,
+                        "max_results": 10,  # More papers to choose from
+                        "sortBy": "relevance",
+                        "sortOrder": "descending"
+                    }
+                    
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(base_url, params=params) as response:
+                            if response.status == 200:
+                                content = await response.text()
+                                feed = feedparser.parse(content)
+                                
+                                papers = []
+                                for entry in feed.entries:
+                                    # Extract PDF URL
+                                    pdf_url = None
+                                    for link in entry.links:
+                                        if link.type == "application/pdf":
+                                            pdf_url = link.href
+                                            break
+                                    
+                                    if pdf_url:
+                                        # Clean up title and authors
+                                        title = entry.title.strip()
+                                        authors = [author.name for author in entry.authors]
+                                        authors_str = ", ".join(authors[:3])  # Show first 3 authors
+                                        if len(authors) > 3:
+                                            authors_str += " et al."
+                                        
+                                        papers.append({
+                                            "title": title,
+                                            "authors": authors,
+                                            "authors_str": authors_str,
+                                            "pdf_url": pdf_url,
+                                            "arxiv_id": entry.id.split("/")[-1],
+                                            "published": getattr(entry, 'published', 'Unknown'),
+                                            "summary": getattr(entry, 'summary', '')[:200] + "..."
+                                        })
+                                
+                                yield f"Found {len(papers)} papers with PDFs\n"
+                                yield "```\n\n"
+                                
+                                if not papers:
+                                    yield "[WARNING] **No papers with PDFs found for this query**\n"
+                                    return
+                                
+                                # Display papers for selection
+                                yield "## [PAPERS] Found Papers - Choose which to insert:\n\n"
+                                yield "*Reply with the paper numbers you want to insert (e.g., '1,3,5' or 'all')*\n\n"
+                                
+                                for i, paper in enumerate(papers, 1):
+                                    yield f"**{i}.** {paper['title']}\n"
+                                    yield f"   [AUTHORS] **Authors:** {paper['authors_str']}\n"
+                                    yield f"   [ID] **arXiv ID:** {paper['arxiv_id']}\n"
+                                    yield f"   [DATE] **Published:** {paper['published'][:10]}\n"
+                                    yield f"   [SUMMARY] **Summary:** {paper['summary']}\n\n"
+                                
+                                yield "---\n\n"
+                                yield "[INFO] **Instructions:**\n"
+                                yield "- Type paper numbers separated by commas: `/insert-selected 1,3,5`\n"
+                                yield "- Or insert all papers: `/insert-selected all`\n"
+                                yield "- Or search again with a different query\n\n"
+                                
+                                # Store papers in session for later selection
+                                session = self.get_or_create_session(chat_id)
+                                session.pending_arxiv_papers = papers
+                                
+                            else:
+                                yield f"```\n\n[ERROR] **Error:** Failed to search arXiv (HTTP {response.status})\n"
+                
+                except Exception as e:
+                    yield f"[ERROR] **Error during arXiv search:** {str(e)}\n"
+                
+                return
+            
+            elif user_message.lower().startswith("/insert-selected "):
+                # Handle selected paper insertion
+                selection = user_message[16:].strip().lower()
+                
+                session = self.get_or_create_session(chat_id)
+                if not hasattr(session, 'pending_arxiv_papers') or not session.pending_arxiv_papers:
+                    yield "[ERROR] **No papers available for selection.** Use `/insert-arxiv <query>` first.\n"
+                    return
+                
+                papers = session.pending_arxiv_papers
+                selected_papers = []
+                
+                try:
+                    if selection == "all":
+                        selected_papers = papers
+                        yield f"# Inserting All {len(papers)} Papers\n\n"
+                    else:
+                        # Parse selected numbers
+                        indices = [int(x.strip()) - 1 for x in selection.split(",") if x.strip().isdigit()]
+                        selected_papers = [papers[i] for i in indices if 0 <= i < len(papers)]
+                        
+                        if not selected_papers:
+                            yield "[ERROR] **Invalid selection.** Please use numbers like '1,3,5' or 'all'.\n"
+                            return
+                        
+                        yield f"# Inserting {len(selected_papers)} Selected Papers\n\n"
+                    
+                    # Import requirements for download and insertion
+                    try:
+                        import aiohttp
+                        import tempfile
+                        from pathlib import Path
+                    except ImportError as e:
+                        yield f"[ERROR] **Error:** Missing required package: {str(e)}\n"
+                        return
+                    
+                    yield "**[PROGRESS] Downloading papers to current directory:**\n\n"
+                    
+                    # Download to current working directory
+                    import os
+                    current_dir = Path(os.getcwd())
+                    downloads_dir = current_dir / "arxiv_papers"
+                    downloads_dir.mkdir(exist_ok=True)
+                    
+                    yield f"[INFO] **Download folder:** `{downloads_dir}`\n\n"
+                    
+                    successful = 0
+                    failed = 0
+                    
+                    async with aiohttp.ClientSession() as session_http:
+                        for i, paper in enumerate(selected_papers, 1):
+                            # Progress indicator
+                            progress_percent = int((i-1) / len(selected_papers) * 100)
+                            progress_bar = "=" * (progress_percent // 10) + "-" * (10 - progress_percent // 10)
+                            yield f"[PROGRESS] **Progress: [{progress_bar}] {progress_percent}%**\n\n"
+                            yield f"[PAPER] **[{i}/{len(selected_papers)}] {paper['title'][:50]}...**\n"
+                            
+                            try:
+                                # Download PDF to session folder
+                                filename = f"{paper['arxiv_id'].replace('/', '_')}.pdf"
+                                download_path = downloads_dir / filename
+                                
+                                # Skip if already downloaded
+                                if download_path.exists():
+                                    yield f"   [SKIP] Already downloaded: {filename}\n"
+                                    successful += 1
+                                    continue
+                                
+                                yield f"   [DOWNLOAD] Downloading PDF...\n"
+                                async with session_http.get(paper['pdf_url']) as pdf_response:
+                                    if pdf_response.status == 200:
+                                        content = await pdf_response.read()
+                                        with open(download_path, 'wb') as f:
+                                            f.write(content)
+                                        
+                                        yield f"   [OK] Downloaded ({len(content)//1024} KB)\n"
+                                        
+                                        successful += 1
+                                    else:
+                                        yield f"   [ERROR] Failed to download PDF (HTTP {pdf_response.status})\n"
+                                        failed += 1
+                            
+                            except Exception as e:
+                                yield f"   [ERROR] Exception: {str(e)}\n"
+                                failed += 1
+                            
+                            yield f"\n"
+                            # Small delay between downloads
+                            if i < len(selected_papers):
+                                await asyncio.sleep(1)
+                    
+                    
+                    # Clear pending papers
+                    session.pending_arxiv_papers = None
+                    
+                    yield f"---\n\n"
+                    yield f"# [COMPLETE] Download Complete\n\n"
+                    yield f"**Summary:**\n"
+                    yield f"- [OK] Successfully downloaded: **{successful}** papers\n"
+                    yield f"- [ERROR] Failed: **{failed}** papers\n"
+                    yield f"- [TOTAL] Total selected: **{len(selected_papers)}** papers\n\n"
+                    yield f"[FOLDER] **Papers saved to:** `{downloads_dir}`\n\n"
+                    
+                    if successful > 0:
+                        yield f"**[NEXT] Use F9 to insert papers into knowledge base:**\n"
+                        yield f"- Insert folder: `{downloads_dir}`\n"
+                        yield f"- Or insert individual files from the folder\n\n"
+                    
+                    yield f"**Download complete!** Papers ready for manual insertion.\n"
+                
+                except Exception as e:
+                    yield f"[ERROR] **Error during paper insertion:** {str(e)}\n"
+                
+                return
+            
+            elif user_message.lower() == "/list-docs":
+                # List all indexed documents
+                session = self.get_or_create_session(chat_id)
+                
+                yield "# Indexed Documents\n\n"
+                
+                if not session.indexed_documents:
+                    yield "📂 **No documents indexed in this session**\n\n"
+                    yield "Use `/insert <file>`, `/insert-folder <folder>`, or **F9** to add documents.\n"
+                else:
+                    yield f"📚 **Total indexed documents:** {len(session.indexed_documents)}\n\n"
+                    yield "**Document List:**\n\n"
+                    
+                    for i, doc_path in enumerate(sorted(session.indexed_documents), 1):
+                        doc_name = Path(doc_path).name
+                        yield f"{i}. `{doc_name}`\n"
+                        yield f"   Path: `{doc_path}`\n\n"
+                    
+                    session_info = self.get_session_info(chat_id)
+                    yield f"📂 **Session storage:** `{session_info.get('working_dir', 'Unknown')}`\n"
+                    yield f"🔧 **Current query mode:** `{self.default_query_mode}`\n"
+                
+                return
+            
             elif user_message.lower().startswith("/query "):
                 # Handle query with specific mode
                 query_parts = user_message[7:].strip().split(" ", 1)
@@ -779,13 +1139,25 @@ Use `/query <mode> <question>` to override for specific queries.
 # Nano-GraphRAG Commands
 
 ## Document Management
-- `/insert <file_path>` - Insert a document (PDF, TXT, MD, DOCX) into the knowledge base
+- `/insert <file_path>` - Insert a single document (PDF, TXT, MD, DOCX) into the knowledge base
+- `/insert-folder <folder_path>` - Insert all supported documents from a folder
+- `/insert-arxiv <search_query>` - Search arXiv papers and select which to download
+- `/insert-selected <numbers>` - Download papers to current directory (e.g., '1,3,5' or 'all')
 - `/insert-text <text>` - Insert raw text into the knowledge base
+
+## Enhanced Insertion (via F9 key)
+- Press **F9** to open the enhanced document insertion interface with:
+  - File browser with directory tree
+  - Bulk folder insertion with filters
+  - arXiv paper search and download
+  - Duplicate detection options
+  - File type filtering
 
 ## Query Commands
 - `/query <mode> <question>` - Query with specific mode (global/local/naive)
 - `/mode <mode>` - Change default query mode for regular messages
-- `/status` - Show session status
+- `/status` - Show session status and indexed documents
+- `/list-docs` - List all indexed documents in current session
 - `/help` - Show this help message
 
 ## Query Modes
@@ -795,11 +1167,15 @@ Use `/query <mode> <question>` to override for specific queries.
 
 ## Examples
 - `/insert C:\\Documents\\research.pdf`
+- `/insert-folder C:\\Documents\\Papers\\`
+- `/insert-arxiv machine learning transformers` (search papers)
+- `/insert-selected 1,3,5` (download to current directory)
 - `/query global What are the main themes in the documents?`
 - `/query local Tell me about John Smith`
 - `/mode global`
 
 Regular messages will be answered using the current default mode if documents are available.
+**Press F9 for the enhanced insertion interface with all advanced features!**
 """
                 yield help_text
                 return

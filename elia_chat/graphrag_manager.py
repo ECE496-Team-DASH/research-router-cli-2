@@ -22,10 +22,19 @@ except ImportError:
     QueryParam = None
 
 try:
-    import PyPDF2
+    import fitz  # pymupdf
     PDF_AVAILABLE = True
+    PYMUPDF_AVAILABLE = True
+    FALLBACK_TO_PYPDF2 = False
 except ImportError:
-    PDF_AVAILABLE = False
+    PYMUPDF_AVAILABLE = False
+    try:
+        import PyPDF2
+        PDF_AVAILABLE = True
+        FALLBACK_TO_PYPDF2 = True
+    except ImportError:
+        PDF_AVAILABLE = False
+        FALLBACK_TO_PYPDF2 = False
 
 try:
     import docx
@@ -58,16 +67,28 @@ class DocumentParser:
     
     @staticmethod
     def extract_text_from_pdf(file_path: Path) -> str:
-        """Extract text from .pdf files."""
+        """Extract text from .pdf files using pymupdf (preferred) or PyPDF2 (fallback)."""
         if not PDF_AVAILABLE:
-            raise ImportError("PyPDF2 is required for PDF processing. Install with: pip install PyPDF2")
+            raise ImportError("pymupdf or PyPDF2 is required for PDF processing. Install with: pip install pymupdf")
         
         text = ""
         try:
-            with open(file_path, 'rb') as f:
-                reader = PyPDF2.PdfReader(f)
-                for page in reader.pages:
-                    text += page.extract_text() + "\n"
+            # Try pymupdf first (better text extraction)
+            if PYMUPDF_AVAILABLE:
+                doc = fitz.open(str(file_path))
+                for page_num in range(len(doc)):
+                    page = doc.load_page(page_num)
+                    text += page.get_text() + "\n"
+                doc.close()
+            # Fallback to PyPDF2 if pymupdf not available
+            elif FALLBACK_TO_PYPDF2:
+                with open(file_path, 'rb') as f:
+                    reader = PyPDF2.PdfReader(f)
+                    for page in reader.pages:
+                        text += page.extract_text() + "\n"
+            else:
+                raise ImportError("No PDF library available")
+                
         except Exception as e:
             log.error(f"Error reading PDF {file_path}: {e}")
             return ""

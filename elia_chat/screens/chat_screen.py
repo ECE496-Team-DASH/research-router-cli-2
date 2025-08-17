@@ -26,9 +26,9 @@ class ChatScreen(Screen[None]):
         Binding(
             key="f9",
             action="insert_document",
-            description="Insert document",
+            description="Insert docs",
             key_display="F9",
-            tooltip="Insert a document into nano-graphrag session.",
+            tooltip="Insert documents into nano-graphrag session.",
         ),
     ]
 
@@ -79,7 +79,7 @@ class ChatScreen(Screen[None]):
         """Action to insert a document into nano-graphrag session."""
         # Check if this is a nano-graphrag model
         model_name = self.chat_data.model.name
-        if not model_name.startswith("nano-graphrag-"):
+        if model_name != "nano-graphrag":
             self.app.notify(
                 "Document insertion is only available for Nano-GraphRAG models.",
                 title="Feature Not Available",
@@ -87,62 +87,179 @@ class ChatScreen(Screen[None]):
             )
             return
         
-        # Modal for user to enter a document path
-        class DocumentInsertModal(ModalScreen[str | None]):
-            DEFAULT_CSS = """
-            DocumentInsertModal {
-                align: center middle;
-            }
+        # Simple file path input - minimal modal
+        from elia_chat.widgets.file_input_modal import FileInputModal
+        
+        def handle_file_input(file_path: str) -> None:
+            if file_path and file_path.strip():
+                self.run_worker(self._insert_document_into_nanographrag(file_path.strip()), exclusive=False)
 
-            DocumentInsertModal > Container {
-                width: 70;
-                height: 9;
-                background: $surface;
-                border: thick $primary;
-                padding: 1 2;
-            }
-
-            DocumentInsertModal Input {
-                width: 100%;
-                margin: 1 0;
-            }
-
-            DocumentInsertModal .hint {
-                color: $text-muted;
-                text-style: italic;
-            }
-            """
-
-            def compose(self) -> ComposeResult:  # type: ignore[override]
-                yield Container(
-                    Static("Enter path to document to insert", classes="title"),
-                    Input(placeholder="e.g. ./docs/example.md", id="document-path-input"),
-                    Static("Press Enter to confirm, Esc to cancel", classes="hint"),
-                )
-
-            def on_mount(self) -> None:  # type: ignore[override]
-                try:
-                    self.set_focus(self.query_one("#document-path-input", Input))
-                except Exception:
-                    pass
-
-            @on(Input.Submitted)
-            def submitted(self, event: Input.Submitted) -> None:  # type: ignore[override]
-                value = event.value.strip()
-                if value:
-                    self.dismiss(value)
-                else:
-                    self.app.notify("Please enter a file path", severity="warning")
-
-            def key_escape(self) -> None:  # type: ignore[override]
-                self.dismiss(None)
-
-        def handle_file_path(file_path: str | None) -> None:
-            if file_path:
-                self.run_worker(self._insert_document_into_nanographrag(file_path), exclusive=False)
-
-        self.app.push_screen(DocumentInsertModal(), handle_file_path)
+        self.app.push_screen(FileInputModal(), handle_file_input)
     
+    async def _process_enhanced_insertion(self, result: dict) -> None:
+        """Process the enhanced document insertion with bulk operations and arXiv support."""
+        import os, asyncio, shutil
+        from datetime import datetime, timezone
+        from pathlib import Path
+        from elia_chat.models import ChatMessage
+        from elia_chat.widgets.chatbox import Chatbox
+        from elia_chat.widgets.agent_is_typing import ResponseStatus
+
+        response_chatbox = None
+        response_status = None
+        temp_cleanup_dirs = []
+        
+        try:
+            model_name = self.chat_data.model.name
+            files_to_process = result["files"]
+            mode = result["mode"]
+            options = result["options"]
+            download_dir = result.get("download_dir")
+            
+            if download_dir:
+                temp_cleanup_dirs.append(download_dir)
+
+            # Prepare streaming chatbox
+            ai_message = {"content": "", "role": "assistant"}
+            now = datetime.now(timezone.utc)
+            cm = ChatMessage(message=ai_message, model=self.chat_data.model, timestamp=now)
+            response_chatbox = Chatbox(message=cm, model=self.chat_data.model, classes="response-in-progress")
+            
+            if mode == "simple_files":
+                if len(files_to_process) == 1:
+                    response_chatbox.border_title = "Inserting document into GraphRAG..."
+                else:
+                    response_chatbox.border_title = f"Inserting {len(files_to_process)} documents into GraphRAG..."
+            elif mode == "single":
+                response_chatbox.border_title = "Inserting document into GraphRAG..."
+            elif mode == "folder":
+                response_chatbox.border_title = f"Inserting {len(files_to_process)} documents from folder..."
+            elif mode == "arxiv":
+                response_chatbox.border_title = f"Inserting {len(files_to_process)} arXiv papers..."
+
+            chat_widget = self.query_one(Chat)
+            chat_container = chat_widget.query_one("#chat-container")
+            await chat_container.mount(response_chatbox)
+
+            response_status = self.query_one(ResponseStatus)
+            response_status.set_agent_responding()
+            response_status.display = True
+
+            # Load nanographrag model
+            from elia_chat.nanographrag_model import get_nanographrag_model
+            from elia_chat.config import load_nanographrag_config
+            nanographrag_model = get_nanographrag_model(model_name, load_nanographrag_config())
+            if not nanographrag_model:
+                response_chatbox.append_chunk("❌ Failed to get nano-graphrag model instance\n")
+                return
+            if not self.chat_data.id:
+                response_chatbox.append_chunk("❌ Chat session not initialized\n")
+                return
+
+            # Display overview
+            response_chatbox.append_chunk(f"🚀 Starting {mode} insertion mode\n")
+            response_chatbox.append_chunk(f"📊 Total files to process: {len(files_to_process)}\n")
+            if options["skip_duplicates"]:
+                response_chatbox.append_chunk("⚠️ Skipping duplicates: Enabled\n")
+            response_chatbox.append_chunk("\n")
+
+            # Process files
+            successful = 0
+            skipped = 0
+            failed = 0
+            
+            for i, file_path in enumerate(files_to_process, 1):
+                filename = file_path.name
+                response_chatbox.append_chunk(f"📄 [{i}/{len(files_to_process)}] Processing: {filename}\n")
+                
+                collected_lines = []
+                def push_line(line: str):
+                    collected_lines.append(line)
+
+                try:
+                    # Check if file should be skipped due to duplicates
+                    session = nanographrag_model.get_or_create_session(self.chat_data.id)
+                    doc_key = str(file_path.absolute())
+                    
+                    if options["skip_duplicates"] and doc_key in session.indexed_documents:
+                        response_chatbox.append_chunk(f"   ⏭️ Already indexed - skipping\n")
+                        skipped += 1
+                        continue
+                    
+                    # Insert document
+                    result_data = await nanographrag_model.insert_document(
+                        self.chat_data.id, str(file_path), line_callback=push_line
+                    )
+                    
+                    if "error" in result_data:
+                        response_chatbox.append_chunk(f"   ❌ Error: {result_data['error']}\n")
+                        failed += 1
+                    elif result_data.get("status") == "skipped":
+                        response_chatbox.append_chunk(f"   ⚠️ Skipped: {result_data.get('message', 'Already indexed')}\n")
+                        skipped += 1
+                    else:
+                        response_chatbox.append_chunk(f"   ✅ Success: {result_data.get('message', 'Indexed successfully')}\n")
+                        successful += 1
+                    
+                    # Show brief logs if there were any significant issues
+                    if collected_lines and any("error" in line.lower() or "warning" in line.lower() for line in collected_lines):
+                        response_chatbox.append_chunk(f"   📋 Key logs: {len(collected_lines)} entries\n")
+                        for line in collected_lines[-3:]:  # Show last 3 lines
+                            if line.strip() and ("error" in line.lower() or "warning" in line.lower()):
+                                response_chatbox.append_chunk(f"      {line.strip()}\n")
+                    
+                except Exception as e:
+                    response_chatbox.append_chunk(f"   ❌ Exception: {str(e)}\n")
+                    failed += 1
+                
+                # Add spacing between files
+                response_chatbox.append_chunk("\n")
+                
+                # Brief pause for UI responsiveness
+                await asyncio.sleep(0.1)
+
+            # Summary
+            response_chatbox.append_chunk("📊 **Insertion Summary:**\n")
+            response_chatbox.append_chunk(f"   ✅ Successfully indexed: {successful}\n")
+            response_chatbox.append_chunk(f"   ⏭️ Skipped (duplicates): {skipped}\n")
+            response_chatbox.append_chunk(f"   ❌ Failed: {failed}\n")
+            response_chatbox.append_chunk(f"   📁 Total processed: {len(files_to_process)}\n")
+
+            if successful > 0:
+                session_info = nanographrag_model.get_session_info(self.chat_data.id)
+                if session_info:
+                    response_chatbox.append_chunk(f"\n📚 Total documents in session: {session_info.get('indexed_documents', 0)}\n")
+                    response_chatbox.append_chunk(f"📂 Session storage: {session_info.get('working_dir', 'Unknown')}\n")
+
+            if mode == "arxiv":
+                response_chatbox.append_chunk("\n🔗 arXiv papers are now available for querying!\n")
+            
+            response_chatbox.append_chunk("\n🎉 Bulk insertion completed! You can now ask questions about the content.\n")
+
+            # Persist chat message
+            self.chat_data.messages.append(cm)
+            if self.chat_data.id:
+                await self.chats_manager.add_message_to_chat(chat_id=self.chat_data.id, message=response_chatbox.message)
+
+        except Exception as exc:
+            if response_chatbox:
+                response_chatbox.append_chunk(f"\n❌ Error during bulk insertion: {exc}\n")
+                response_chatbox.border_title = "Bulk insertion failed"
+        finally:
+            # Cleanup temporary directories
+            for temp_dir in temp_cleanup_dirs:
+                try:
+                    if temp_dir.exists():
+                        shutil.rmtree(temp_dir)
+                except Exception as e:
+                    log.error(f"Failed to cleanup temp directory {temp_dir}: {e}")
+            
+            if response_chatbox:
+                response_chatbox.border_title = response_chatbox.border_title or "Bulk insertion completed"
+                response_chatbox.remove_class("response-in-progress")
+            if response_status:
+                response_status.display = False
+
     async def _insert_document_into_nanographrag(self, file_path: str) -> None:
         import os, asyncio
         from datetime import datetime, timezone
