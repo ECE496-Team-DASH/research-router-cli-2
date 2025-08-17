@@ -1,6 +1,8 @@
 import os
+import tomllib
 from pathlib import Path
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, SecretStr
+from typing import Dict, Any
 
 
 class EliaChatModel(BaseModel):
@@ -142,11 +144,148 @@ def get_builtin_google_models() -> list[EliaChatModel]:
 
 
 def get_builtin_models() -> list[EliaChatModel]:
-    return (
+    models = (
         get_builtin_openai_models()
         + get_builtin_anthropic_models()
         + get_builtin_google_models()
+        + get_builtin_nanographrag_models()
     )
+    return models
+
+
+class NanoGraphRAGConfig(BaseModel):
+    """Configuration for Nano-GraphRAG integration."""
+    
+    enabled: bool = Field(default=False)
+    """Whether Nano-GraphRAG models are enabled."""
+    
+    working_dir: str = Field(default="~/.elia/nanographrag")
+    """Base directory for GraphRAG working directories."""
+    
+    openai_api_key: str | None = Field(default=None)
+    """OpenAI API key for GraphRAG operations."""
+    
+    best_model: str = Field(default="gpt-4o")
+    """Best model for GraphRAG operations (entity extraction, etc.)."""
+    
+    cheap_model: str = Field(default="gpt-4o-mini")
+    """Cheaper model for GraphRAG operations (summarization, etc.)."""
+    
+    query_mode: str = Field(default="global")
+    """Default query mode: global, local, or naive."""
+    
+    max_context_length: int = Field(default=4000)
+    """Maximum context length for responses."""
+    
+    embedding_model: str | None = Field(default=None)
+    """Custom embedding model to use."""
+
+
+def get_builtin_nanographrag_models() -> list[EliaChatModel]:
+    """Get built-in nano-graphrag models if available."""
+    try:
+        # Create the models directly without importing from nanographrag_model
+        # to avoid any potential import issues
+        models = []
+        
+        # Global GraphRAG model
+        models.append(EliaChatModel(
+            id="nano-graphrag-global",
+            name="nano-graphrag-global", 
+            display_name="Nano-GraphRAG (Global)",
+            provider="Nano-GraphRAG",
+            product="GraphRAG",
+            description="Knowledge graph-powered chat with global analysis. Best for broad questions spanning multiple topics.",
+            temperature=0.7,
+        ))
+        
+        # Local GraphRAG model
+        models.append(EliaChatModel(
+            id="nano-graphrag-local",
+            name="nano-graphrag-local",
+            display_name="Nano-GraphRAG (Local)",
+            provider="Nano-GraphRAG",
+            product="GraphRAG",
+            description="Knowledge graph-powered chat with local search. Best for specific entity-focused questions.",
+            temperature=0.7,
+        ))
+        
+        # Naive RAG model
+        models.append(EliaChatModel(
+            id="nano-graphrag-naive",
+            name="nano-graphrag-naive",
+            display_name="Nano-GraphRAG (Naive)",
+            provider="Nano-GraphRAG", 
+            product="GraphRAG",
+            description="Traditional RAG without graph structure. Good for simple document search.",
+            temperature=0.7,
+        ))
+        
+        return models
+    except Exception as e:
+        # Catch all exceptions to avoid breaking the model list
+        import logging
+        logging.debug(f"Failed to load nano-graphrag models: {e}")
+    
+    return []
+
+
+def load_nanographrag_config() -> Dict[str, Any]:
+    """Load nano-graphrag configuration from config.toml file."""
+    from elia_chat.locations import config_directory
+    
+    config_file = config_directory() / "nanographrag.toml"
+    
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config_data = tomllib.load(f)
+            return config_data.get("nanographrag", {})
+        except Exception:
+            pass
+    
+    return {}
+
+
+def save_nanographrag_config(config: Dict[str, Any]) -> bool:
+    """Save nano-graphrag configuration to config.toml file."""
+    from elia_chat.locations import config_directory
+    
+    config_directory().mkdir(parents=True, exist_ok=True)
+    config_file = config_directory() / "nanographrag.toml"
+    
+    try:
+        # Load existing config or create new
+        existing_config = {}
+        if config_file.exists():
+            with open(config_file, "rb") as f:
+                existing_config = tomllib.load(f)
+        
+        # Update nanographrag section
+        existing_config["nanographrag"] = config
+        
+        # Write config file (we'll need tomli_w for writing)
+        try:
+            import tomli_w
+            with open(config_file, "wb") as f:
+                tomli_w.dump(existing_config, f)
+        except ImportError:
+            # Fallback to simple format
+            lines = ["[nanographrag]"]
+            for key, value in config.items():
+                if isinstance(value, str):
+                    lines.append(f'{key} = "{value}"')
+                elif isinstance(value, bool):
+                    lines.append(f'{key} = {str(value).lower()}')
+                else:
+                    lines.append(f'{key} = {value}')
+            
+            with open(config_file, "w") as f:
+                f.write("\n".join(lines))
+        
+        return True
+    except Exception:
+        return False
 
 
 class GraphRAGConfig(BaseModel):
@@ -194,6 +333,7 @@ class LaunchConfig(BaseModel):
     )
     theme: str = Field(default="nebula")
     graphrag: GraphRAGConfig = Field(default_factory=GraphRAGConfig)
+    nanographrag: NanoGraphRAGConfig = Field(default_factory=NanoGraphRAGConfig)
 
     @property
     def all_models(self) -> list[EliaChatModel]:

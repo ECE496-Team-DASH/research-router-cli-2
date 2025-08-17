@@ -162,3 +162,4 @@ cython_debug/
 elia.sqlite
 **/*.pyc
 resources/conversations.json
+nanographrag_storage/*

@@ -164,6 +164,9 @@ class Chat(Widget):
         model = self.chat_data.model
         log.debug(f"Creating streaming response with model {model.name!r}")
 
+        # Check if this is a nano-graphrag model
+        is_nanographrag = model.name.startswith("nano-graphrag-")
+        
         # Get the last user message for GraphRAG context
         last_user_message = ""
         for msg in reversed(self.chat_data.messages):
@@ -193,27 +196,45 @@ class Chat(Widget):
         ), "Textual has mounted container at this point in the lifecycle."
 
         try:
-            # Check if we should use GraphRAG for this query
-            use_graphrag = await self.graphrag_manager.should_use_graphrag(last_user_message)
-            
-            if use_graphrag:
-                log.debug("Using GraphRAG-enhanced response")
-                response_stream = self.graphrag_manager.generate_enhanced_response(
-                    self.chat_data, last_user_message, model
-                )
+            if is_nanographrag:
+                # Handle nano-graphrag models
+                log.debug("Using nano-graphrag model response")
+                from elia_chat.nanographrag_model import get_nanographrag_model
+                from elia_chat.config import load_nanographrag_config
+                
+                nanographrag_config = load_nanographrag_config()
+                nanographrag_model = get_nanographrag_model(model.name, nanographrag_config)
+                
+                if nanographrag_model and self.chat_data.id:
+                    response_stream = nanographrag_model.generate_response(
+                        self.chat_data, last_user_message
+                    )
+                    response_chatbox.border_title = "Agent is responding (with Nano-GraphRAG)..."
+                else:
+                    # Fallback to regular response if nano-graphrag fails
+                    response_stream = self.graphrag_manager.generate_regular_response(
+                        self.chat_data, model
+                    )
+                    response_chatbox.border_title = "Agent is responding..."
             else:
-                log.debug("Using regular LLM response")
-                response_stream = self.graphrag_manager.generate_regular_response(
-                    self.chat_data, model
-                )
+                # Handle regular models with existing GraphRAG logic
+                use_graphrag = await self.graphrag_manager.should_use_graphrag(last_user_message)
+                
+                if use_graphrag:
+                    log.debug("Using GraphRAG-enhanced response")
+                    response_stream = self.graphrag_manager.generate_enhanced_response(
+                        self.chat_data, last_user_message, model
+                    )
+                    response_chatbox.border_title = "Agent is responding (with GraphRAG)..."
+                else:
+                    log.debug("Using regular LLM response")
+                    response_stream = self.graphrag_manager.generate_regular_response(
+                        self.chat_data, model
+                    )
+                    response_chatbox.border_title = "Agent is responding..."
 
             chunk_count = 0
             async for chunk_content in response_stream:
-                if use_graphrag:
-                    response_chatbox.border_title = "Agent is responding (with GraphRAG)..."
-                else:
-                    response_chatbox.border_title = "Agent is responding..."
-
                 if isinstance(chunk_content, str):
                     self.app.call_from_thread(
                         response_chatbox.append_chunk, chunk_content

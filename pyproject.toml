@@ -21,6 +21,7 @@ dependencies = [
     "PyPDF2>=3.0.0",
     "python-docx>=1.1.0",
     "nano-graphrag>=0.0.8.2",
+    "transformers>=4.55.2",
 ]
 readme = "README.md"
 requires-python = ">= 3.11"
@@ -42,6 +43,9 @@ dev-dependencies = [
     "textual-dev>=1.0.1",
     "pyinstrument>=4.6.2",
 ]
+
+[tool.uv.sources]
+nano-graphrag = { path = "nano-graphrag", editable = true }
 
 [tool.mypy]
 ignore_missing_imports = true

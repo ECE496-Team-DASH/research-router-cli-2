@@ -31,6 +31,7 @@ class Elia(App[None]):
     BINDINGS = [
         Binding("q", "app.quit", "Quit", show=False),
         Binding("f1,?", "help", "Help"),
+        Binding("f9", "insert_document", "Insert document", show=True),
     ]
 
     def __init__(self, config: LaunchConfig, startup_prompt: str = ""):
@@ -45,6 +46,7 @@ class Elia(App[None]):
             selected_model=config.default_model_object,
             system_prompt=config.system_prompt,
             graphrag_config=config.graphrag,
+            nanographrag_config=config.nanographrag,
         )
         self.runtime_config_signal = Signal[RuntimeConfig](
             self, "runtime-config-updated"
@@ -121,6 +123,26 @@ class Elia(App[None]):
         else:
             await self.push_screen(HelpScreen())
 
+    def action_insert_document(self) -> None:
+        """Action to insert a document into nano-graphrag session."""
+        # Check if we're in a chat screen
+        if hasattr(self.screen, 'chat_data'):
+            # Delegate to the chat screen's insert_document action
+            if hasattr(self.screen, 'action_insert_document'):
+                self.screen.action_insert_document()
+            else:
+                self.notify(
+                    "Document insertion is only available in chat sessions with Nano-GraphRAG models.",
+                    title="Feature Not Available",
+                    severity="warning",
+                )
+        else:
+            self.notify(
+                "Document insertion is only available in chat sessions.",
+                title="Feature Not Available", 
+                severity="warning",
+            )
+
     def get_css_variables(self) -> dict[str, str]:
         # Handle case where theme might be accessed during initialization
         try:
@@ -140,11 +162,13 @@ class Elia(App[None]):
 
         return {**super().get_css_variables(), **color_system}
 
-    def watch_theme(self, theme: str) -> None:
+    def watch_theme(self, theme: str | None) -> None:
         """Called when the theme changes."""
         # Only refresh CSS if we have screens on the stack
-        if self.screen_stack:
+        if hasattr(self, 'screen_stack') and self.screen_stack:
             self.refresh_css(animate=False)
+            if hasattr(self, 'screen') and self.screen:
+                self.screen._update_styles()
 
     @property
     def theme_object(self) -> Theme | None:
