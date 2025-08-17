@@ -184,40 +184,17 @@ class NanoGraphRAGConfig(BaseModel):
 def get_builtin_nanographrag_models() -> list[EliaChatModel]:
     """Get built-in nano-graphrag models if available."""
     try:
-        # Create the models directly without importing from nanographrag_model
-        # to avoid any potential import issues
+        # Create a single unified nano-graphrag model
+        # Query modes are handled within the chat session via commands
         models = []
         
-        # Global GraphRAG model
         models.append(EliaChatModel(
-            id="nano-graphrag-global",
-            name="nano-graphrag-global", 
-            display_name="Nano-GraphRAG (Global)",
+            id="nano-graphrag",
+            name="nano-graphrag", 
+            display_name="Nano-GraphRAG",
             provider="Nano-GraphRAG",
             product="GraphRAG",
-            description="Knowledge graph-powered chat with global analysis. Best for broad questions spanning multiple topics.",
-            temperature=0.7,
-        ))
-        
-        # Local GraphRAG model
-        models.append(EliaChatModel(
-            id="nano-graphrag-local",
-            name="nano-graphrag-local",
-            display_name="Nano-GraphRAG (Local)",
-            provider="Nano-GraphRAG",
-            product="GraphRAG",
-            description="Knowledge graph-powered chat with local search. Best for specific entity-focused questions.",
-            temperature=0.7,
-        ))
-        
-        # Naive RAG model
-        models.append(EliaChatModel(
-            id="nano-graphrag-naive",
-            name="nano-graphrag-naive",
-            display_name="Nano-GraphRAG (Naive)",
-            provider="Nano-GraphRAG", 
-            product="GraphRAG",
-            description="Traditional RAG without graph structure. Good for simple document search.",
+            description="Knowledge graph-powered chat with document indexing and multiple query modes. Use /help for commands.",
             temperature=0.7,
         ))
         

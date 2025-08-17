@@ -163,3 +163,5 @@ elia.sqlite
 **/*.pyc
 resources/conversations.json
 nanographrag_storage/*
+*.pdf
+*.txt

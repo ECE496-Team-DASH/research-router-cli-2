@@ -226,24 +226,77 @@ class NanoGraphRAGModel:
             try:
                 import logging as _logging
                 bridge_logger = _logging.getLogger("nano-graphrag")
+                
                 class _BridgeHandler(_logging.Handler):
                     def emit(self, record):
                         msg = self.format(record)
-                        emit_line(f"[log] {msg}\n")
+                        # Filter out overly verbose debug messages and format appropriately
+                        level = record.levelname
+                        if level == "INFO":
+                            emit_line(f"[log] {msg}\n")
+                        elif level == "WARNING":
+                            emit_line(f"[warning] {msg}\n")
+                        elif level == "ERROR":
+                            emit_line(f"[error] {msg}\n")
+                        else:
+                            emit_line(f"[{level.lower()}] {msg}\n")
+                
                 bridge_handler = _BridgeHandler()
                 bridge_handler.setLevel(_logging.INFO)
-                bridge_handler.setFormatter(_logging.Formatter('%(levelname)s %(message)s'))
+                bridge_handler.setFormatter(_logging.Formatter('%(message)s'))
+                
+                # Remove any existing handlers to avoid duplicates
+                for handler in bridge_logger.handlers[:]:
+                    bridge_logger.removeHandler(handler)
+                
                 bridge_logger.addHandler(bridge_handler)
-                bridge_logger.propagate = True
+                bridge_logger.setLevel(_logging.INFO)
+                bridge_logger.propagate = False  # Prevent propagation to avoid duplicate logs
             except Exception:
                 bridge_handler = None
 
             try:
                 if hasattr(session.graphrag_instance, 'ainsert'):
                     emit_line("Mode: async ainsert\n")
-                    with capture():
-                        await session.graphrag_instance.ainsert(text_content)
-                        await flush()
+                    
+                    # Create a progress monitoring task
+                    progress_task = None
+                    
+                    async def progress_monitor():
+                        """Monitor progress and emit periodic updates during long operations"""
+                        steps = [
+                            "Processing chunks...",
+                            "Extracting entities...", 
+                            "Building knowledge graph...",
+                            "Generating community reports...",
+                            "Finalizing storage..."
+                        ]
+                        step_idx = 0
+                        while True:
+                            await asyncio.sleep(3)  # Update every 3 seconds
+                            if step_idx < len(steps):
+                                emit_line(f"[progress] {steps[step_idx]}\n")
+                                step_idx += 1
+                            else:
+                                emit_line("[progress] Still processing...\n")
+                    
+                    try:
+                        # Start progress monitoring
+                        progress_task = asyncio.create_task(progress_monitor())
+                        
+                        # Run the actual insertion
+                        with capture():
+                            await session.graphrag_instance.ainsert(text_content)
+                            await flush()
+                        
+                    finally:
+                        # Stop progress monitoring
+                        if progress_task:
+                            progress_task.cancel()
+                            try:
+                                await progress_task
+                            except asyncio.CancelledError:
+                                pass
                 else:
                     emit_line("Mode: sync insert (thread)\n")
                     loop = asyncio.get_event_loop()
@@ -312,30 +365,99 @@ class NanoGraphRAGModel:
             log.error(f"Error inserting text: {e}")
             return {"error": f"Failed to insert text: {str(e)}"}
     
-    async def query_graphrag(self, chat_id: int, query: str, mode: Optional[str] = None) -> str:
-        """Query the GraphRAG session."""
+    async def query_graphrag(self, chat_id: int, query: str, mode: Optional[str] = None, *, line_callback: Optional[Callable[[str], None]] = None) -> str:
+        """Query the GraphRAG session with optional log streaming."""
         session = self.get_or_create_session(chat_id)
         
         if not session.graphrag_instance:
             return "Error: GraphRAG not available for this session."
         
+        def emit_line(txt: str):
+            if line_callback:
+                try:
+                    line_callback(txt if txt.endswith("\n") else txt + "\n")
+                except Exception:
+                    pass
+        
         try:
             query_mode = mode or self.default_query_mode
             param = QueryParam(mode=query_mode)
             
-            # Query GraphRAG
-            if hasattr(session.graphrag_instance, 'aquery'):
-                result = await session.graphrag_instance.aquery(query, param=param)
-            else:
-                # Run sync query in executor
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    None, session.graphrag_instance.query, query, param
-                )
+            emit_line(f"[QUERY] Starting {query_mode} query")
+            emit_line(f"[QUERY] Question: {query}")
             
-            return result
+            # Set up logging capture for HTTP requests and other logs
+            bridge_handler = None
+            try:
+                import logging as _logging
+                
+                # Capture logs from multiple sources
+                loggers_to_capture = [
+                    "nano-graphrag",
+                    "httpx", 
+                    "openai",
+                    "requests",
+                    "urllib3"
+                ]
+                
+                class _QueryBridgeHandler(_logging.Handler):
+                    def emit(self, record):
+                        msg = self.format(record)
+                        logger_name = record.name
+                        level = record.levelname
+                        
+                        if "HTTP Request" in msg:
+                            emit_line(f"[HTTP] {msg}")
+                        elif level == "INFO":
+                            emit_line(f"[{logger_name}] {msg}")
+                        elif level == "WARNING":
+                            emit_line(f"[WARNING] {msg}")
+                        elif level == "ERROR":
+                            emit_line(f"[ERROR] {msg}")
+                        else:
+                            emit_line(f"[{level}] {msg}")
+                
+                bridge_handler = _QueryBridgeHandler()
+                bridge_handler.setLevel(_logging.INFO)
+                bridge_handler.setFormatter(_logging.Formatter('%(message)s'))
+                
+                # Add handler to multiple loggers
+                for logger_name in loggers_to_capture:
+                    logger = _logging.getLogger(logger_name)
+                    logger.addHandler(bridge_handler)
+                    logger.setLevel(_logging.INFO)
+                    
+            except Exception:
+                bridge_handler = None
+            
+            try:
+                # Query GraphRAG
+                if hasattr(session.graphrag_instance, 'aquery'):
+                    emit_line("[QUERY] Using async query")
+                    result = await session.graphrag_instance.aquery(query, param=param)
+                else:
+                    emit_line("[QUERY] Using sync query in executor")
+                    # Run sync query in executor
+                    loop = asyncio.get_event_loop()
+                    result = await loop.run_in_executor(
+                        None, session.graphrag_instance.query, query, param
+                    )
+                
+                emit_line("[QUERY] Query completed successfully")
+                return result
+                
+            finally:
+                # Clean up log handlers
+                if bridge_handler:
+                    try:
+                        for logger_name in loggers_to_capture:
+                            logger = _logging.getLogger(logger_name)
+                            logger.removeHandler(bridge_handler)
+                    except Exception:
+                        pass
             
         except Exception as e:
+            emit_line(f"[ERROR] Query failed: {str(e)}")
             log.error(f"Error querying GraphRAG: {e}")
             return f"Error querying knowledge base: {str(e)}"
     
@@ -360,44 +482,324 @@ class NanoGraphRAGModel:
             if user_message.lower().startswith("/insert "):
                 # Handle document insertion
                 doc_path = user_message[8:].strip()
-                result = await self.insert_document(chat_id, doc_path)
-                yield f"Document insertion result: {result.get('message', result.get('error', 'Unknown result'))}"
+                
+                # Start with initial message
+                yield "# Document Insertion Starting\n\n[INIT] **Preparing to insert document...**\n\n"
+                yield "**[PROGRESS] Insertion Progress:**\n\n```\n"
+                
+                # Use a queue to collect log lines for streaming
+                log_queue = asyncio.Queue()
+                
+                def progress_callback(line: str):
+                    if line.strip():
+                        # Format log lines with simple text-based indicators
+                        if line.startswith("[insert]"):
+                            formatted_line = f"[INSERT] {line.strip()}"
+                        elif line.startswith("[path]"):
+                            formatted_line = f"[PATH] {line.strip()}"
+                        elif line.startswith("[session]"):
+                            formatted_line = f"[SESSION] {line.strip()}"
+                        elif line.startswith("[file]"):
+                            formatted_line = f"[FILE] {line.strip()}"
+                        elif line.startswith("[log]"):
+                            formatted_line = f"[LOG] {line.strip()}"
+                        elif line.startswith("[warning]"):
+                            formatted_line = f"[WARNING] {line.strip()}"
+                        elif line.startswith("[error]"):
+                            formatted_line = f"[ERROR] {line.strip()}"
+                        elif line.startswith("[progress]"):
+                            formatted_line = f"[STEP] {line.strip()}"
+                        elif line.startswith("[trace]"):
+                            formatted_line = f"[TRACE] {line.strip()}"
+                        elif "Insertion finished" in line:
+                            formatted_line = f"[SUCCESS] {line.strip()}"
+                        elif "Starting GraphRAG insertion" in line:
+                            formatted_line = f"[START] {line.strip()}"
+                        elif "Reading" in line:
+                            formatted_line = f"[READ] {line.strip()}"
+                        elif "Content length:" in line:
+                            formatted_line = f"[DATA] {line.strip()}"
+                        elif "Entity Extraction" in line:
+                            formatted_line = f"[EXTRACT] {line.strip()}"
+                        elif "Community Report" in line:
+                            formatted_line = f"[REPORT] {line.strip()}"
+                        elif "inserting" in line.lower():
+                            formatted_line = f"[STORE] {line.strip()}"
+                        elif "Mode:" in line:
+                            formatted_line = f"[MODE] {line.strip()}"
+                        else:
+                            formatted_line = f"[INFO] {line.strip()}"
+                        
+                        # Put the formatted line in the queue (non-blocking)
+                        try:
+                            log_queue.put_nowait(formatted_line)
+                        except asyncio.QueueFull:
+                            pass  # Skip if queue is full
+                
+                # Create an async task for the document insertion
+                async def insertion_task():
+                    return await self.insert_document(chat_id, doc_path, line_callback=progress_callback)
+                
+                # Start the insertion task
+                task = asyncio.create_task(insertion_task())
+                
+                # Stream log lines as they come in
+                while not task.done():
+                    try:
+                        # Wait for log lines with a short timeout
+                        log_line = await asyncio.wait_for(log_queue.get(), timeout=0.1)
+                        yield f"{log_line}\n"
+                    except asyncio.TimeoutError:
+                        # No log line available, continue checking if task is done
+                        continue
+                    except Exception:
+                        # Any other error, break the loop
+                        break
+                
+                # Drain any remaining log lines
+                while not log_queue.empty():
+                    try:
+                        log_line = log_queue.get_nowait()
+                        yield f"{log_line}\n"
+                    except asyncio.QueueEmpty:
+                        break
+                
+                # Close the code block
+                yield "```\n"
+                
+                # Get the result
+                try:
+                    result = await task
+                except Exception as e:
+                    result = {"error": f"Failed to insert document: {str(e)}"}
+                
+                yield "\n---\n\n"
+                
+                # Format the result with progress
+                if result.get('status') == 'success':
+                    response = f"""
+# Document Insertion Successful
+
+[SUCCESS] **{result.get('message', 'Document indexed successfully')}**
+
+- **Total indexed documents:** {result.get('document_count', 'Unknown')}
+- **Session:** {chat_id}
+
+You can now ask questions using:
+- Regular messages (uses current mode: **{self.default_query_mode}**)
+- `/query <mode> <question>` for specific modes
+- `/help` for more commands
+"""
+                elif result.get('status') == 'skipped':
+                    response = f"""
+# Document Already Indexed
+
+[SKIPPED] **{result.get('message', 'Document was already in the knowledge base')}**
+
+- **Total indexed documents:** {result.get('document_count', 'Unknown')}
+- **Session:** {chat_id}
+"""
+                else:
+                    response = f"""
+# Document Insertion Failed
+
+[ERROR] **Error:** {result.get('error', 'Unknown error occurred')}
+
+Please check:
+- File path is correct and accessible
+- File format is supported (.txt, .md, .pdf, .docx)
+- You have read permissions for the file
+
+Example: `/insert C:\\path\\to\\document.txt`
+"""
+                
+                yield response
                 return
             
             elif user_message.lower().startswith("/insert-text "):
                 # Handle text insertion
                 text_content = user_message[13:].strip()
                 result = await self.insert_text(chat_id, text_content)
-                yield f"Text insertion result: {result.get('message', result.get('error', 'Unknown result'))}"
+                
+                if result.get('status') == 'success':
+                    response = f"""
+# Text Insertion Successful
+
+[SUCCESS] **Text content indexed successfully**
+
+- **Text length:** {result.get('text_length', 'Unknown')} characters
+- **Session:** {chat_id}
+
+You can now ask questions about the inserted text using:
+- Regular messages (uses current mode: **{self.default_query_mode}**)
+- `/query <mode> <question>` for specific modes
+"""
+                else:
+                    response = f"""
+# Text Insertion Failed
+
+[ERROR] **Error:** {result.get('error', 'Unknown error occurred')}
+
+Please check:
+- Text content is not empty
+- Text is properly formatted
+
+Example: `/insert-text This is important information about the project.`
+"""
+                
+                yield response
                 return
             
-            elif user_message.lower().startswith("/query-mode "):
-                # Handle query mode change
-                new_mode = user_message[12:].strip()
-                if new_mode in ["global", "local", "naive"]:
-                    self.default_query_mode = new_mode
-                    yield f"Query mode changed to: {new_mode}"
+            elif user_message.lower().startswith("/query "):
+                # Handle query with specific mode
+                query_parts = user_message[7:].strip().split(" ", 1)
+                if len(query_parts) >= 2:
+                    mode = query_parts[0].lower()
+                    query_text = query_parts[1]
+                    if mode in ["global", "local", "naive"]:
+                        # Set up streaming logs for the query
+                        yield f"# Query Response ({mode.title()} Mode)\n\n"
+                        yield "**[QUERY] Processing:**\n\n```\n"
+                        
+                        # Use a queue to collect log lines for streaming
+                        query_log_queue = asyncio.Queue()
+                        
+                        def query_progress_callback(line: str):
+                            if line.strip():
+                                # Format query log lines
+                                formatted_line = line.strip()
+                                try:
+                                    query_log_queue.put_nowait(formatted_line)
+                                except asyncio.QueueFull:
+                                    pass
+                        
+                        # Create an async task for the query
+                        async def query_task():
+                            return await self.query_graphrag(chat_id, query_text, mode, line_callback=query_progress_callback)
+                        
+                        # Start the query task
+                        task = asyncio.create_task(query_task())
+                        
+                        # Stream log lines as they come in
+                        while not task.done():
+                            try:
+                                # Wait for log lines with a short timeout
+                                log_line = await asyncio.wait_for(query_log_queue.get(), timeout=0.1)
+                                yield f"{log_line}\n"
+                            except asyncio.TimeoutError:
+                                # No log line available, continue checking if task is done
+                                continue
+                            except Exception:
+                                # Any other error, break the loop
+                                break
+                        
+                        # Drain any remaining log lines
+                        while not query_log_queue.empty():
+                            try:
+                                log_line = query_log_queue.get_nowait()
+                                yield f"{log_line}\n"
+                            except asyncio.QueueEmpty:
+                                break
+                        
+                        # Close the log block and get the result
+                        yield "```\n\n"
+                        
+                        try:
+                            response = await task
+                        except Exception as e:
+                            yield f"[ERROR] Query failed: {str(e)}\n"
+                            return
+                        
+                        # Stream the response in chunks with proper formatting
+                        yield "**[RESPONSE] Answer:**\n\n"
+                        lines = response.split('\n')
+                        current_line = ""
+                        
+                        for line in lines:
+                            current_line += line + "\n"
+                            # Check if we have enough content to yield
+                            if len(current_line) >= 100 or line.strip() == "" or line.startswith('#') or line.startswith('-') or line.startswith('*'):
+                                if current_line.strip():
+                                    yield current_line
+                                    current_line = ""
+                                    await asyncio.sleep(0.1)
+                        
+                        # Yield any remaining content
+                        if current_line.strip():
+                            yield current_line
+                    else:
+                        yield f"Invalid query mode. Available modes: global, local, naive"
                 else:
-                    yield f"Invalid query mode. Available modes: global, local, naive"
+                    yield "Usage: /query <mode> <question>\nExample: /query global What are the main topics?"
+                return
+            
+            elif user_message.lower().startswith("/mode "):
+                # Handle query mode change
+                new_mode = user_message[6:].strip()
+                if new_mode in ["global", "local", "naive"]:
+                    old_mode = self.default_query_mode
+                    self.default_query_mode = new_mode
+                    response = f"""
+# Query Mode Changed
+
+[MODE] **Default query mode updated**
+
+- **Previous mode:** {old_mode}
+- **New mode:** {new_mode}
+
+## Mode Descriptions
+- **global** - Broad analysis across all documents
+- **local** - Entity-focused search  
+- **naive** - Traditional document search
+
+Regular messages will now use the **{new_mode}** mode by default.
+Use `/query <mode> <question>` to override for specific queries.
+"""
+                else:
+                    response = f"""
+# Invalid Query Mode
+
+[ERROR] **Error:** `{new_mode}` is not a valid query mode.
+
+## Available Modes
+- **global** - Broad analysis across all documents
+- **local** - Entity-focused search
+- **naive** - Traditional document search
+
+**Usage:** `/mode <global|local|naive>`
+**Example:** `/mode global`
+"""
+                
+                yield response
                 return
             
             elif user_message.lower() == "/help":
                 # Show help
                 help_text = """
-**Nano-GraphRAG Commands:**
+# Nano-GraphRAG Commands
 
+## Document Management
 - `/insert <file_path>` - Insert a document (PDF, TXT, MD, DOCX) into the knowledge base
-- `/insert-text <text>` - Insert raw text into the knowledge base  
-- `/query-mode <mode>` - Change query mode (global, local, naive)
+- `/insert-text <text>` - Insert raw text into the knowledge base
+
+## Query Commands
+- `/query <mode> <question>` - Query with specific mode (global/local/naive)
+- `/mode <mode>` - Change default query mode for regular messages
 - `/status` - Show session status
 - `/help` - Show this help message
 
-**Query Modes:**
-- `global` - Use global graph analysis (good for broad questions)
-- `local` - Use local graph search (good for specific entities)
-- `naive` - Use traditional RAG without graph structure
+## Query Modes
+- **global** - Use global graph analysis (good for broad questions spanning topics)
+- **local** - Use local graph search (good for specific entity-focused questions)
+- **naive** - Use traditional RAG without graph structure (simple document search)
 
-Regular messages will be answered using the knowledge base if available.
+## Examples
+- `/insert C:\\Documents\\research.pdf`
+- `/query global What are the main themes in the documents?`
+- `/query local Tell me about John Smith`
+- `/mode global`
+
+Regular messages will be answered using the current default mode if documents are available.
 """
                 yield help_text
                 return
@@ -406,12 +808,18 @@ Regular messages will be answered using the knowledge base if available.
                 # Show session status
                 session = self.get_or_create_session(chat_id)
                 status_text = f"""
-**Session Status:**
-- Session ID: {session.session_id}
-- Working Directory: {session.working_dir}
-- GraphRAG Available: {session.graphrag_instance is not None}
-- Indexed Documents: {len(session.indexed_documents)}
-- Query Mode: {self.default_query_mode}
+# Session Status
+
+- **Session ID:** {session.session_id}
+- **Working Directory:** {session.working_dir}
+- **GraphRAG Available:** {session.graphrag_instance is not None}
+- **Indexed Documents:** {len(session.indexed_documents)}
+- **Current Query Mode:** {self.default_query_mode}
+
+## Available Query Modes
+- **global** - Broad analysis across all documents
+- **local** - Entity-focused search
+- **naive** - Traditional document search
 """
                 yield status_text
                 return
@@ -420,26 +828,94 @@ Regular messages will be answered using the knowledge base if available.
             session = self.get_or_create_session(chat_id)
             
             if not session.indexed_documents:
-                yield "❌ No documents have been inserted into this GraphRAG session yet.\n"
-                yield "Please use `/insert <file_path>` to add documents before asking questions.\n"
-                yield "Supported formats: .txt, .md, .pdf, .docx\n"
-                yield "Example: `/insert C:\\path\\to\\document.txt`\n"
+                no_docs_message = """
+# No Documents Available
+
+[EMPTY] **No documents have been inserted into this GraphRAG session yet.**
+
+To get started:
+1. Use `/insert <file_path>` to add documents to the knowledge base
+2. Supported formats: `.txt`, `.md`, `.pdf`, `.docx`
+3. Example: `/insert C:\\path\\to\\document.txt`
+
+Once documents are indexed, you can:
+- Ask questions using the current query mode (**{mode}**)
+- Use `/query <mode> <question>` for specific query modes
+- Use `/help` for more commands
+""".format(mode=self.default_query_mode)
+                yield no_docs_message
                 return
             
-            response = await self.query_graphrag(chat_id, user_message)
+            # Set up streaming logs for the regular query
+            yield f"# Query Response ({self.default_query_mode.title()} Mode)\n\n"
+            yield "**[QUERY] Processing:**\n\n```\n"
             
-            # Stream the response in chunks
-            chunk_size = 50  # Adjust as needed
-            words = response.split()
+            # Use a queue to collect log lines for streaming
+            query_log_queue = asyncio.Queue()
             
-            for i in range(0, len(words), chunk_size):
-                chunk = " ".join(words[i:i + chunk_size])
-                if i + chunk_size < len(words):
-                    chunk += " "
-                yield chunk
-                
-                # Small delay to simulate streaming
-                await asyncio.sleep(0.05)
+            def query_progress_callback(line: str):
+                if line.strip():
+                    # Format query log lines
+                    formatted_line = line.strip()
+                    try:
+                        query_log_queue.put_nowait(formatted_line)
+                    except asyncio.QueueFull:
+                        pass
+            
+            # Create an async task for the query
+            async def query_task():
+                return await self.query_graphrag(chat_id, user_message, line_callback=query_progress_callback)
+            
+            # Start the query task
+            task = asyncio.create_task(query_task())
+            
+            # Stream log lines as they come in
+            while not task.done():
+                try:
+                    # Wait for log lines with a short timeout
+                    log_line = await asyncio.wait_for(query_log_queue.get(), timeout=0.1)
+                    yield f"{log_line}\n"
+                except asyncio.TimeoutError:
+                    # No log line available, continue checking if task is done
+                    continue
+                except Exception:
+                    # Any other error, break the loop
+                    break
+            
+            # Drain any remaining log lines
+            while not query_log_queue.empty():
+                try:
+                    log_line = query_log_queue.get_nowait()
+                    yield f"{log_line}\n"
+                except asyncio.QueueEmpty:
+                    break
+            
+            # Close the log block and get the result
+            yield "```\n\n"
+            
+            try:
+                response = await task
+            except Exception as e:
+                yield f"[ERROR] Query failed: {str(e)}\n"
+                return
+            
+            # Stream the response in chunks with proper formatting
+            yield "**[RESPONSE] Answer:**\n\n"
+            lines = response.split('\n')
+            current_line = ""
+            
+            for line in lines:
+                current_line += line + "\n"
+                # Check if we have enough content to yield (about 100-200 chars)
+                if len(current_line) >= 100 or line.strip() == "" or line.startswith('#') or line.startswith('-') or line.startswith('*'):
+                    if current_line.strip():
+                        yield current_line
+                        current_line = ""
+                        await asyncio.sleep(0.1)  # Slightly longer delay for better readability
+            
+            # Yield any remaining content
+            if current_line.strip():
+                yield current_line
                 
         except Exception as e:
             log.error(f"Error in stream_response: {e}")
@@ -448,7 +924,7 @@ Regular messages will be answered using the knowledge base if available.
     async def generate_response(self, chat_data, user_message: str) -> AsyncGenerator[str, None]:
         """Generate a response using nano-graphrag - compatibility method for chat.py."""
         if not chat_data.id:
-            yield "❌ Chat session not initialized properly.\n"
+            yield "[ERROR] Chat session not initialized properly.\n"
             return
             
         # Convert to the expected message format and delegate to stream_response
@@ -481,41 +957,16 @@ def create_nanographrag_models(nanographrag_config: Dict[str, Any]) -> list[Elia
     """Create nano-graphrag model configurations."""
     models = []
     
-    # Create model configurations regardless of availability
-    # The actual availability will be checked when models are used
+    # Create single unified model configuration
+    # Query modes are handled within the chat session via commands
     
-    # Global GraphRAG model
     models.append(EliaChatModel(
-        id="nano-graphrag-global",
-        name="nano-graphrag-global", 
-        display_name="Nano-GraphRAG (Global)",
+        id="nano-graphrag",
+        name="nano-graphrag", 
+        display_name="Nano-GraphRAG",
         provider="Nano-GraphRAG",
         product="GraphRAG",
-        description="Knowledge graph-powered chat with global analysis. Best for broad questions spanning multiple topics." + 
-                   ("" if NANO_GRAPHRAG_AVAILABLE else " [Requires nano-graphrag installation]"),
-        temperature=0.7,
-    ))
-    
-    # Local GraphRAG model
-    models.append(EliaChatModel(
-        id="nano-graphrag-local",
-        name="nano-graphrag-local",
-        display_name="Nano-GraphRAG (Local)",
-        provider="Nano-GraphRAG",
-        product="GraphRAG",
-        description="Knowledge graph-powered chat with local search. Best for specific entity-focused questions." +
-                   ("" if NANO_GRAPHRAG_AVAILABLE else " [Requires nano-graphrag installation]"),
-        temperature=0.7,
-    ))
-    
-    # Naive RAG model
-    models.append(EliaChatModel(
-        id="nano-graphrag-naive",
-        name="nano-graphrag-naive",
-        display_name="Nano-GraphRAG (Naive)",
-        provider="Nano-GraphRAG", 
-        product="GraphRAG",
-        description="Traditional RAG without graph structure. Good for simple document search." +
+        description="Knowledge graph-powered chat with document indexing and multiple query modes. Use /help for commands." + 
                    ("" if NANO_GRAPHRAG_AVAILABLE else " [Requires nano-graphrag installation]"),
         temperature=0.7,
     ))
@@ -544,4 +995,4 @@ def get_nanographrag_model(model_name: str, nanographrag_config: Dict[str, Any])
 
 def is_nanographrag_model(model_name: str) -> bool:
     """Check if a model name is a nano-graphrag model."""
-    return model_name.startswith("nano-graphrag-")
+    return model_name == "nano-graphrag"

@@ -165,7 +165,7 @@ class Chat(Widget):
         log.debug(f"Creating streaming response with model {model.name!r}")
 
         # Check if this is a nano-graphrag model
-        is_nanographrag = model.name.startswith("nano-graphrag-")
+        is_nanographrag = model.name == "nano-graphrag"
         
         # Get the last user message for GraphRAG context
         last_user_message = ""
